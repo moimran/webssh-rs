@@ -88,7 +88,8 @@ impl SSHSession {
         
         // Set up the PTY
         debug!("Requesting PTY");
-        channel.request_pty("dumb", None, Some((80, 24, 0, 0)))?;
+        // Use xterm instead of dumb for better terminal support
+        channel.request_pty("xterm", None, Some((80, 24, 0, 0)))?;
         
         // Start shell
         debug!("Starting shell");

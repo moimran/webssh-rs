@@ -114,7 +114,9 @@
                         theme: {
                             background: '#000000',
                             foreground: '#ffffff'
-                        }
+                        },
+                        disableStdin: false,
+                        allowProposedApi: true
                     });
 
                     fitAddon = new FitAddon.FitAddon();
@@ -235,12 +237,18 @@
                     ws.send(JSON.stringify(dimensions));
 
                     // Handle terminal input
+                    // Disable local echo by handling input manually
+                    // We send the data to the server but don't echo it locally
                     term.onData(data => {
                         if (ws && ws.readyState === WebSocket.OPEN) {
+                            // Send the data to the server without echoing locally
                             ws.send(JSON.stringify({
                                 type: 'input',
                                 data: data
                             }));
+                            
+                            // We don't call term.write(data) here, which prevents local echo
+                            // The server will echo back the characters if needed
                         }
                     });
                 };

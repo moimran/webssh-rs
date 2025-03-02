@@ -18,6 +18,7 @@ pub struct WebSocketHandler {
     socket: WebSocket,
     ssh_input_tx: mpsc::Sender<Bytes>,
     ssh_output_rx: mpsc::Receiver<Bytes>,
+    resize_tx: Option<mpsc::Sender<(u32, u32)>>,
 }
 
 impl WebSocketHandler {
@@ -30,7 +31,12 @@ impl WebSocketHandler {
             socket,
             ssh_input_tx,
             ssh_output_rx,
+            resize_tx: None,
         }
+    }
+    
+    pub fn set_resize_channel(&mut self, resize_tx: mpsc::Sender<(u32, u32)>) {
+        self.resize_tx = Some(resize_tx);
     }
 
     pub async fn handle(mut self) {
@@ -39,6 +45,7 @@ impl WebSocketHandler {
 
         // Handle incoming WebSocket messages
         let ssh_input_tx = self.ssh_input_tx.clone();
+        let resize_tx = self.resize_tx.clone();
         tokio::spawn(async move {
             debug!("Starting WebSocket receiver task");
             while let Some(Ok(msg)) = ws_receiver.next().await {
@@ -56,10 +63,12 @@ impl WebSocketHandler {
                                 }
                                 WSCommand::Resize { rows, cols } => {
                                     debug!("Processing resize command: {}x{}", cols, rows);
-                                    // Send ANSI escape sequence for window resize
-                                    let resize_cmd = format!("\x1b[8;{};{}t", rows, cols);
-                                    if let Err(e) = ssh_input_tx.send(Bytes::from(resize_cmd)).await {
-                                        error!("Failed to send resize command: {}", e);
+                                    if let Some(ref resize_tx) = resize_tx {
+                                        if let Err(e) = resize_tx.send((rows, cols)).await {
+                                            error!("Failed to send resize command: {}", e);
+                                        }
+                                    } else {
+                                        debug!("Resize channel not set, ignoring resize command");
                                     }
                                 }
                             }

@@ -126,10 +126,16 @@ async fn ws_handler(
     }
 }
 
-async fn handle_socket(socket: WebSocket, session: SSHSession) {
+async fn handle_socket(socket: WebSocket, mut session: SSHSession) {
     // Create channels for SSH communication
     let (ssh_input_tx, ssh_input_rx) = mpsc::channel::<Bytes>(32);
     let (ssh_output_tx, ssh_output_rx) = mpsc::channel::<Bytes>(32);
+    
+    // Create resize channel
+    let (resize_tx, resize_rx) = mpsc::channel::<(u32, u32)>(8);
+    
+    // Set resize channel on SSH session
+    session.set_resize_channel(resize_rx);
 
     // Start SSH I/O in a separate thread
     tokio::task::spawn_blocking(move || {
@@ -139,7 +145,10 @@ async fn handle_socket(socket: WebSocket, session: SSHSession) {
     });
 
     // Create WebSocket handler
-    let ws_handler = WebSocketHandler::new(socket, ssh_input_tx, ssh_output_rx);
+    let mut ws_handler = WebSocketHandler::new(socket, ssh_input_tx, ssh_output_rx);
+    
+    // Set resize channel on WebSocket handler
+    ws_handler.set_resize_channel(resize_tx);
     
     // Start WebSocket handler
     ws_handler.handle().await;

@@ -19,6 +19,7 @@ pub enum SSHError {
 pub struct SSHSession {
     session: Session,
     channel: ssh2::Channel,
+    resize_rx: Option<mpsc::Receiver<(u32, u32)>>,
 }
 
 impl SSHSession {
@@ -104,7 +105,18 @@ impl SSHSession {
         Ok(Self { 
             session,
             channel,
+            resize_rx: None,
         })
+    }
+
+    pub fn set_resize_channel(&mut self, resize_rx: mpsc::Receiver<(u32, u32)>) {
+        self.resize_rx = Some(resize_rx);
+    }
+
+    pub fn resize_pty(&mut self, rows: u32, cols: u32) -> Result<(), SSHError> {
+        debug!("Resizing PTY to {}x{}", cols, rows);
+        self.channel.request_pty_size(cols as u32, rows as u32, None, None)?;
+        Ok(())
     }
 
     pub fn start_io(
@@ -175,6 +187,9 @@ impl SSHSession {
             output
         }
         
+        // Take ownership of the resize channel if it exists
+        let mut resize_rx = self.resize_rx.take();
+        
         loop {
             // Send keepalive every 30 seconds
             if last_keepalive.elapsed() >= std::time::Duration::from_secs(30) {
@@ -184,6 +199,16 @@ impl SSHSession {
                     break;
                 }
                 last_keepalive = std::time::Instant::now();
+            }
+            
+            // Process any pending resize commands
+            if let Some(ref mut rx) = resize_rx {
+                while let Ok((rows, cols)) = rx.try_recv() {
+                    debug!("Processing resize command: {}x{}", cols, rows);
+                    if let Err(e) = self.resize_pty(rows, cols) {
+                        error!("Failed to resize PTY: {}", e);
+                    }
+                }
             }
 
             // Read from SSH with timeout

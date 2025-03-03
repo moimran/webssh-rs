@@ -14,36 +14,123 @@ pub enum DeviceType {
     Unknown,
 }
 
-// Function to detect device type based on hostname or other characteristics
-fn detect_device_type(hostname: &str, port: u16) -> DeviceType {
-    // Common Cisco device IP patterns (e.g., 192.168.0.x where x is 1-20)
-    let is_likely_cisco_ip = hostname.starts_with("192.168.") && 
-                             hostname.split('.').nth(3)
-                                .and_then(|s| s.parse::<u16>().ok())
-                                .map_or(false, |n| n <= 20);
+// Helper functions for device-specific session setup
+fn setup_standard_session(session: &mut Session) -> Result<ssh2::Channel, SSHError> {
+    debug!("Creating SSH channel for standard session");
+    let mut channel = match session.channel_session() {
+        Ok(channel) => {
+            debug!("SSH session channel opened successfully");
+            channel
+        },
+        Err(e) => {
+            error!("Failed to open session channel: {}", e);
+            return Err(e.into());
+        }
+    };
     
-    // Check for Cisco-specific hostnames or IP patterns
-    if hostname.contains("cisco") || 
-       hostname.contains("router") || 
-       hostname.contains("switch") ||
-       is_likely_cisco_ip ||
-       // Common Cisco management ports
-       (port == 22 && (hostname.ends_with(".1") || hostname.ends_with(".254")))
-    {
-        DeviceType::Cisco
-    } 
-    // Check for Linux-specific hostnames
-    else if hostname.contains("linux") || 
-            hostname.contains("ubuntu") || 
-            hostname.contains("debian") || 
-            hostname.contains("centos") || 
-            hostname.contains("fedora") ||
-            hostname.contains("server")
-    {
-        DeviceType::Linux
-    } else {
-        // Default to Unknown, we'll try to detect during connection
-        DeviceType::Unknown
+    // Request PTY with standard terminal type
+    debug!("Requesting PTY with standard terminal type");
+    match channel.request_pty("xterm", None, Some((80, 24, 0, 0))) {
+        Ok(_) => debug!("PTY requested successfully"),
+        Err(e) => {
+            error!("Failed to request PTY: {}", e);
+            return Err(e.into());
+        }
+    }
+    
+    // Start shell - this works for most devices
+    debug!("Starting shell");
+    match channel.shell() {
+        Ok(_) => {
+            debug!("Shell started successfully");
+            Ok(channel)
+        },
+        Err(e) => {
+            error!("Failed to start shell: {}", e);
+            Err(e.into())
+        }
+    }
+}
+
+fn setup_linux_session(session: &mut Session) -> Result<ssh2::Channel, SSHError> {
+    debug!("Creating SSH channel for Linux session");
+    let mut channel = match session.channel_session() {
+        Ok(channel) => {
+            debug!("SSH session channel opened successfully");
+            channel
+        },
+        Err(e) => {
+            error!("Failed to open session channel: {}", e);
+            return Err(e.into());
+        }
+    };
+    
+    // For Linux devices, we'll use vt100
+    debug!("Requesting PTY for Linux device");
+    match channel.request_pty("vt100", None, Some((80, 24, 0, 0))) {
+        Ok(_) => debug!("PTY requested successfully"),
+        Err(e) => {
+            error!("Failed to request PTY: {}", e);
+            // Try with a simpler terminal type as fallback
+            match channel.request_pty("dumb", None, Some((80, 24, 0, 0))) {
+                Ok(_) => debug!("Dumb PTY requested successfully"),
+                Err(e2) => {
+                    error!("Failed to request dumb PTY: {}", e2);
+                    // Don't try more fallbacks - if PTY fails, it's likely a protocol issue
+                    return Err(e.into());
+                }
+            }
+        }
+    }
+    
+    // Try executing bash command - this is the key test for Linux devices
+    debug!("Executing bash command for Linux device");
+    match channel.exec("bash") {
+        Ok(_) => {
+            debug!("Bash command executed successfully - confirmed Linux device");
+            Ok(channel)
+        },
+        Err(e) => {
+            error!("Failed to execute bash command: {}", e);
+            Err(e.into())
+        }
+    }
+}
+
+fn setup_cisco_session(session: &mut Session) -> Result<ssh2::Channel, SSHError> {
+    debug!("Creating SSH channel for Cisco session");
+    let mut channel = match session.channel_session() {
+        Ok(channel) => {
+            debug!("SSH session channel opened successfully");
+            channel
+        },
+        Err(e) => {
+            error!("Failed to open session channel: {}", e);
+            return Err(e.into());
+        }
+    };
+    
+    // For Cisco devices, we'll use xterm and just start a shell
+    debug!("Requesting PTY for Cisco device");
+    match channel.request_pty("xterm", None, Some((80, 24, 0, 0))) {
+        Ok(_) => debug!("PTY requested successfully"),
+        Err(e) => {
+            error!("Failed to request PTY: {}", e);
+            return Err(e.into());
+        }
+    }
+    
+    // Start shell directly for Cisco devices
+    debug!("Starting shell for Cisco device");
+    match channel.shell() {
+        Ok(_) => {
+            debug!("Shell started successfully");
+            Ok(channel)
+        },
+        Err(e) => {
+            error!("Failed to start shell: {}", e);
+            Err(e.into())
+        }
     }
 }
 
@@ -210,103 +297,46 @@ pub fn new(
         }
         debug!("Authentication successful");
 
-        // Detect device type, using hint if provided
-        let device_type = if let Some(hint) = device_type_hint {
-            match hint.to_lowercase().as_str() {
-                "cisco" | "router" | "switch" => DeviceType::Cisco,
-                "linux" | "ubuntu" | "debian" => DeviceType::Linux,
-                _ => detect_device_type(hostname, port),
-            }
-        } else {
-            detect_device_type(hostname, port)
-        };
-        debug!("Using device type: {:?}", device_type);
-        
         // Create a simple channel
         info!("Creating SSH channel");
         
         // Set a longer timeout for channel operations (2 minutes)
         session.set_timeout(120000);
         
-        // Create a simple session channel
-        debug!("Creating SSH channel");
-        let mut channel = match session.channel_session() {
-            Ok(channel) => {
-                debug!("SSH session channel opened successfully");
-                channel
-            },
-            Err(e) => {
-                error!("Failed to open session channel: {}", e);
-                return Err(e.into());
+        // Get device type hint if provided
+        let device_type_hint = device_type_hint.map(|hint| hint.to_lowercase());
+        let is_cisco_hint = device_type_hint.as_ref().map_or(false, |hint| 
+            hint == "cisco" || hint == "router" || hint == "switch");
+        
+        // Set up the channel based on device type with fallback mechanism
+        let mut channel = if is_cisco_hint {
+            debug!("Using Cisco approach based on user hint");
+            setup_cisco_session(&mut session)?
+        } else {
+            // Try standard approach first (similar to electerm)
+            debug!("Trying standard approach first");
+            match setup_standard_session(&mut session) {
+                Ok(channel) => {
+                    debug!("Standard approach succeeded");
+                    channel
+                },
+                Err(e) => {
+                    debug!("Standard approach failed: {}. Trying Linux approach", e);
+                    // If standard approach fails, try Linux approach
+                    match setup_linux_session(&mut session) {
+                        Ok(channel) => {
+                            debug!("Linux approach succeeded");
+                            channel
+                        },
+                        Err(e) => {
+                            debug!("Linux approach failed: {}. Trying Cisco approach as final fallback", e);
+                            // If Linux approach fails, try Cisco approach as final fallback
+                            setup_cisco_session(&mut session)?
+                        }
+                    }
+                }
             }
         };
-        
-        // Set up the session based on device type
-        match device_type {
-            DeviceType::Cisco => {
-                // Cisco devices work better with the original approach
-                debug!("Setting up session for Cisco device");
-                
-                // For Cisco devices, we'll use xterm and just start a shell
-                debug!("Requesting PTY for Cisco device");
-                match channel.request_pty("xterm", None, Some((80, 24, 0, 0))) {
-                    Ok(_) => debug!("PTY requested successfully"),
-                    Err(e) => {
-                        error!("Failed to request PTY: {}", e);
-                        return Err(e.into());
-                    }
-                }
-                
-                // Start shell directly for Cisco devices
-                debug!("Starting shell for Cisco device");
-                match channel.shell() {
-                    Ok(_) => debug!("Shell started successfully"),
-                    Err(e) => {
-                        error!("Failed to start shell: {}", e);
-                        return Err(e.into());
-                    }
-                }
-            },
-            DeviceType::Linux | DeviceType::Unknown => {
-                // Linux devices work better with the new approach
-                debug!("Setting up session for Linux/Unknown device");
-                
-                // For Linux devices, we'll use vt100 and try to execute bash
-                debug!("Requesting PTY for Linux/Unknown device");
-                match channel.request_pty("vt100", None, Some((80, 24, 0, 0))) {
-                    Ok(_) => debug!("PTY requested successfully"),
-                    Err(e) => {
-                        error!("Failed to request PTY: {}", e);
-                        // Try with a simpler terminal type as fallback
-                        match channel.request_pty("dumb", None, Some((80, 24, 0, 0))) {
-                            Ok(_) => debug!("Dumb PTY requested successfully"),
-                            Err(e2) => {
-                                error!("Failed to request dumb PTY: {}", e2);
-                                // Don't try more fallbacks - if PTY fails, it's likely a protocol issue
-                                return Err(e.into());
-                            }
-                        }
-                    }
-                }
-                
-                // Try executing a command instead of starting a shell for Linux devices
-                debug!("Executing command for Linux/Unknown device");
-                match channel.exec("bash") {
-                    Ok(_) => debug!("Command executed successfully"),
-                    Err(e) => {
-                        error!("Failed to execute command: {}", e);
-                        // Try starting a shell as fallback
-                        match channel.shell() {
-                            Ok(_) => debug!("Shell started successfully"),
-                            Err(e2) => {
-                                error!("Failed to start shell: {}", e2);
-                                return Err(e.into());
-                            }
-                        }
-                    }
-                }
-            }
-        }
         
         // Ensure channel is ready with a flush
         debug!("Flushing channel");

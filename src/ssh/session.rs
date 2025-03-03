@@ -2,200 +2,17 @@ use ssh2::Session;
 use std::{io::{Read, Write}, net::TcpStream};
 use tokio::sync::mpsc;
 use bytes::Bytes;
-use thiserror::Error;
 use tracing::{error, info, debug};
 use std::time::Duration;
 
 use crate::settings::SSHSettings;
+use super::error::SSHError;
+use super::channel::{setup_standard_session, setup_linux_session, setup_cisco_session};
 
-// Define device types
-#[derive(Debug, Clone, Copy, PartialEq)]
-#[allow(dead_code)]
-pub enum DeviceType {
-    Linux,
-    Cisco,
-    Unknown,
-}
-
-// Helper functions for device-specific session setup
-fn setup_standard_session(session: &mut Session, settings: &SSHSettings) -> Result<ssh2::Channel, SSHError> {
-    debug!("Creating SSH channel for standard session");
-    let mut channel = match session.channel_session() {
-        Ok(channel) => {
-            debug!("SSH session channel opened successfully");
-            channel
-        },
-        Err(e) => {
-            error!("Failed to open session channel: {}", e);
-            return Err(e.into());
-        }
-    };
-    
-    // Request PTY with standard terminal type
-    debug!("Requesting PTY with standard terminal type");
-    match channel.request_pty(
-        &settings.terminal.standard_terminal_type, 
-        None, 
-        Some((settings.terminal.default_cols, settings.terminal.default_rows, 0, 0))
-    ) {
-        Ok(_) => debug!("PTY requested successfully"),
-        Err(e) => {
-            error!("Failed to request PTY: {}", e);
-            return Err(e.into());
-        }
-    }
-    
-    // Start shell - this works for most devices
-    debug!("Starting shell");
-    match channel.shell() {
-        Ok(_) => {
-            debug!("Shell started successfully");
-            Ok(channel)
-        },
-        Err(e) => {
-            error!("Failed to start shell: {}", e);
-            Err(e.into())
-        }
-    }
-}
-
-fn setup_linux_session(session: &mut Session, settings: &SSHSettings) -> Result<ssh2::Channel, SSHError> {
-    debug!("Creating SSH channel for Linux session");
-    let mut channel = match session.channel_session() {
-        Ok(channel) => {
-            debug!("SSH session channel opened successfully");
-            channel
-        },
-        Err(e) => {
-            error!("Failed to open session channel: {}", e);
-            return Err(e.into());
-        }
-    };
-    
-    // For Linux devices, we'll use the Linux terminal type from settings
-    debug!("Requesting PTY for Linux device");
-    match channel.request_pty(
-        &settings.terminal.linux_terminal_type, 
-        None, 
-        Some((settings.terminal.default_cols, settings.terminal.default_rows, 0, 0))
-    ) {
-        Ok(_) => debug!("PTY requested successfully"),
-        Err(e) => {
-            error!("Failed to request PTY: {}", e);
-            // Try with a simpler terminal type as fallback
-            match channel.request_pty(
-                &settings.terminal.fallback_terminal_type, 
-                None, 
-                Some((settings.terminal.default_cols, settings.terminal.default_rows, 0, 0))
-            ) {
-                Ok(_) => debug!("Dumb PTY requested successfully"),
-                Err(e2) => {
-                    error!("Failed to request dumb PTY: {}", e2);
-                    // Don't try more fallbacks - if PTY fails, it's likely a protocol issue
-                    return Err(e.into());
-                }
-            }
-        }
-    }
-    
-    // Try executing bash command - this is the key test for Linux devices
-    debug!("Executing bash command for Linux device");
-    match channel.exec("bash") {
-        Ok(_) => {
-            debug!("Bash command executed successfully - confirmed Linux device");
-            Ok(channel)
-        },
-        Err(e) => {
-            error!("Failed to execute bash command: {}", e);
-            Err(e.into())
-        }
-    }
-}
-
-fn setup_cisco_session(session: &mut Session, settings: &SSHSettings) -> Result<ssh2::Channel, SSHError> {
-    debug!("Creating SSH channel for Cisco session");
-    let mut channel = match session.channel_session() {
-        Ok(channel) => {
-            debug!("SSH session channel opened successfully");
-            channel
-        },
-        Err(e) => {
-            error!("Failed to open session channel: {}", e);
-            return Err(e.into());
-        }
-    };
-    
-    // For Cisco devices, we'll use the standard terminal type from settings
-    debug!("Requesting PTY for Cisco device");
-    match channel.request_pty(
-        &settings.terminal.standard_terminal_type, 
-        None, 
-        Some((settings.terminal.default_cols, settings.terminal.default_rows, 0, 0))
-    ) {
-        Ok(_) => debug!("PTY requested successfully"),
-        Err(e) => {
-            error!("Failed to request PTY: {}", e);
-            return Err(e.into());
-        }
-    }
-    
-    // Start shell directly for Cisco devices
-    debug!("Starting shell for Cisco device");
-    match channel.shell() {
-        Ok(_) => {
-            debug!("Shell started successfully");
-            Ok(channel)
-        },
-        Err(e) => {
-            error!("Failed to start shell: {}", e);
-            Err(e.into())
-        }
-    }
-}
-
-// Helper function to create a session channel with retries
-#[allow(dead_code)]
-fn create_session_channel_with_retries(
-    session: &mut Session,
-    max_attempts: usize,
-    retry_delay_ms: u64,
-) -> Result<ssh2::Channel, SSHError> {
-    for attempt in 1..=max_attempts {
-        debug!("Session channel creation attempt {}/{}", attempt, max_attempts);
-        match session.channel_session() {
-            Ok(channel) => {
-                debug!("Session channel created successfully on attempt {}", attempt);
-                return Ok(channel);
-            },
-            Err(e) => {
-                if attempt == max_attempts {
-                    error!("Failed to create session channel after {} attempts: {}", max_attempts, e);
-                    return Err(e.into());
-                } else {
-                    debug!("Session channel creation failed on attempt {}: {}", attempt, e);
-                    std::thread::sleep(std::time::Duration::from_millis(retry_delay_ms));
-                }
-            }
-        }
-    }
-    
-    // This should never be reached due to the return in the loop above
-    Err(SSHError::Connection(std::io::Error::new(
-        std::io::ErrorKind::Other,
-        "Failed to create session channel after retries"
-    )))
-}
-
-#[derive(Error, Debug)]
-pub enum SSHError {
-    #[error("SSH connection error: {0}")]
-    Connection(#[from] std::io::Error),
-    #[error("SSH error: {0}")]
-    SSH(#[from] ssh2::Error),
-    #[error("SSH authentication error: {0}")]
-    Authentication(String),
-}
-
+/// Represents an active SSH session with a remote server
+/// 
+/// This struct manages the SSH connection, authentication, and I/O operations
+/// between the web client and the SSH server.
 pub struct SSHSession {
     session: Session,
     channel: ssh2::Channel,
@@ -204,15 +21,28 @@ pub struct SSHSession {
 }
 
 impl SSHSession {
-pub fn new(
-    hostname: &str,
-    port: u16,
-    username: &str,
-    password: Option<&str>,
-    private_key: Option<&str>,
-    device_type_hint: Option<&str>,
-    settings: &SSHSettings,
-) -> Result<Self, SSHError> {
+    /// Creates a new SSH session with the specified connection parameters
+    ///
+    /// # Arguments
+    /// * `hostname` - The hostname or IP address of the SSH server
+    /// * `port` - The port number of the SSH server (typically 22)
+    /// * `username` - The username for authentication
+    /// * `password` - Optional password for authentication
+    /// * `private_key` - Optional private key for authentication (in PEM format)
+    /// * `device_type_hint` - Optional hint about the device type (e.g., "cisco", "linux")
+    /// * `settings` - SSH settings from the application configuration
+    ///
+    /// # Returns
+    /// * `Result<Self, SSHError>` - A new SSHSession or an error
+    pub fn new(
+        hostname: &str,
+        port: u16,
+        username: &str,
+        password: Option<&str>,
+        private_key: Option<&str>,
+        device_type_hint: Option<&str>,
+        settings: &SSHSettings,
+    ) -> Result<Self, SSHError> {
         info!("Connecting to SSH server {}:{}", hostname, port);
         
         // Create TCP connection with timeout
@@ -260,11 +90,10 @@ pub fn new(
         debug!("Starting SSH handshake");
         
         // Log available methods before handshake
-        // Note: These might not be available until after the handshake
-        debug!("Configured KEX methods: curve25519-sha256,curve25519-sha256@libssh.org,ecdh-sha2-nistp256,ecdh-sha2-nistp384,ecdh-sha2-nistp521,diffie-hellman-group-exchange-sha256,diffie-hellman-group16-sha512,diffie-hellman-group18-sha512,diffie-hellman-group14-sha256,diffie-hellman-group14-sha1,diffie-hellman-group1-sha1");
-        debug!("Configured host key methods: ssh-ed25519,ecdsa-sha2-nistp256,ecdsa-sha2-nistp384,ecdsa-sha2-nistp521,rsa-sha2-512,rsa-sha2-256,ssh-rsa,ssh-dss");
-        debug!("Configured client->server encryption methods: chacha20-poly1305@openssh.com,aes256-gcm@openssh.com,aes128-gcm@openssh.com,aes256-ctr,aes192-ctr,aes128-ctr,aes256-cbc,aes192-cbc,aes128-cbc,3des-cbc");
-        debug!("Configured server->client encryption methods: chacha20-poly1305@openssh.com,aes256-gcm@openssh.com,aes128-gcm@openssh.com,aes256-ctr,aes192-ctr,aes128-ctr,aes256-cbc,aes192-cbc,aes128-cbc,3des-cbc");
+        debug!("Configured KEX methods: {}", settings.crypto.kex_algorithms);
+        debug!("Configured host key methods: {}", settings.crypto.host_key_algorithms);
+        debug!("Configured client->server encryption methods: {}", settings.crypto.encryption_client_to_server);
+        debug!("Configured server->client encryption methods: {}", settings.crypto.encryption_server_to_client);
         
         // Perform handshake with detailed error handling
         match session.handshake() {
@@ -378,16 +207,42 @@ pub fn new(
         })
     }
 
+    /// Sets the channel for receiving terminal resize events
+    ///
+    /// # Arguments
+    /// * `resize_rx` - A receiver for (rows, cols) tuples
     pub fn set_resize_channel(&mut self, resize_rx: mpsc::Receiver<(u32, u32)>) {
         self.resize_rx = Some(resize_rx);
     }
 
+    /// Resizes the PTY to the specified dimensions
+    ///
+    /// # Arguments
+    /// * `rows` - Number of rows in the terminal
+    /// * `cols` - Number of columns in the terminal
+    ///
+    /// # Returns
+    /// * `Result<(), SSHError>` - Success or an error
     pub fn resize_pty(&mut self, rows: u32, cols: u32) -> Result<(), SSHError> {
         debug!("Resizing PTY to {}x{}", cols, rows);
         self.channel.request_pty_size(cols as u32, rows as u32, None, None)?;
         Ok(())
     }
 
+    /// Starts the I/O handling between the SSH channel and the WebSocket
+    ///
+    /// This function runs in a separate thread and handles:
+    /// - Reading data from the SSH channel and sending it to the WebSocket
+    /// - Reading data from the WebSocket and sending it to the SSH channel
+    /// - Processing terminal resize events
+    /// - Sending keepalive packets
+    ///
+    /// # Arguments
+    /// * `input_rx` - A receiver for data from the WebSocket
+    /// * `output_tx` - A sender for data to the WebSocket
+    ///
+    /// # Returns
+    /// * `Result<(), SSHError>` - Success or an error
     pub fn start_io(
         mut self,
         mut input_rx: mpsc::Receiver<Bytes>,
@@ -398,63 +253,6 @@ pub fn new(
         // Buffer for reading from SSH
         let mut buf = [0u8; 4096];
         let mut last_keepalive = std::time::Instant::now();
-        
-        // Function to clean control sequences
-        fn clean_control_sequences(input: &[u8]) -> Vec<u8> {
-            let mut output = Vec::with_capacity(input.len());
-            let mut i = 0;
-            
-            while i < input.len() {
-                if input[i] == b';' {
-                    // Check if this is part of a terminal code sequence (like ;37;295t)
-                    let mut is_terminal_code = false;
-                    let mut j = i + 1;
-                    while j < input.len() && j < i + 10 {  // Look ahead up to 10 chars
-                        if input[j] == b't' {
-                            is_terminal_code = true;
-                            break;
-                        }
-                        j += 1;
-                    }
-                    if is_terminal_code {
-                        // Skip until we find 't'
-                        while i < input.len() && input[i] != b't' {
-                            i += 1;
-                        }
-                        i += 1;  // Skip the 't'
-                        continue;
-                    }
-                }
-
-                if input[i] == 0x1b {  // ESC
-                    // Skip escape sequence
-                    i += 1;
-                    if i < input.len() && input[i] == b'[' {
-                        i += 1;
-                        while i < input.len() {
-                            let c = input[i];
-                            if (c >= b'A' && c <= b'Z') || (c >= b'a' && c <= b'z') || c == b'@' {
-                                i += 1;
-                                break;
-                            }
-                            i += 1;
-                        }
-                    }
-                } else {
-                    output.push(input[i]);
-                    i += 1;
-                }
-            }
-            
-            // Clean up any remaining terminal codes at the end
-            if let Some(pos) = output.iter().rposition(|&x| x == b';') {
-                if output[pos..].iter().any(|&x| x == b't') {
-                    output.truncate(pos);
-                }
-            }
-            
-            output
-        }
         
         // Take ownership of the resize channel if it exists
         let mut resize_rx = self.resize_rx.take();
@@ -486,7 +284,7 @@ pub fn new(
                     if n > 0 {
                         debug!("Read {} bytes from SSH", n);
                         // Clean control sequences from the output
-                        let cleaned_data = clean_control_sequences(&buf[..n]);
+                        let cleaned_data = Self::clean_control_sequences(&buf[..n]);
                         if !cleaned_data.is_empty() {
                             let data = Bytes::from(cleaned_data);
                             if output_tx.blocking_send(data).is_err() {
@@ -539,5 +337,71 @@ pub fn new(
 
         info!("SSH I/O handling completed");
         Ok(())
+    }
+    
+    /// Cleans control sequences from terminal output
+    ///
+    /// This function removes ANSI escape sequences and other terminal control
+    /// codes that might interfere with the web terminal display.
+    ///
+    /// # Arguments
+    /// * `input` - The raw terminal output
+    ///
+    /// # Returns
+    /// * `Vec<u8>` - The cleaned output
+    fn clean_control_sequences(input: &[u8]) -> Vec<u8> {
+        let mut output = Vec::with_capacity(input.len());
+        let mut i = 0;
+        
+        while i < input.len() {
+            if input[i] == b';' {
+                // Check if this is part of a terminal code sequence (like ;37;295t)
+                let mut is_terminal_code = false;
+                let mut j = i + 1;
+                while j < input.len() && j < i + 10 {  // Look ahead up to 10 chars
+                    if input[j] == b't' {
+                        is_terminal_code = true;
+                        break;
+                    }
+                    j += 1;
+                }
+                if is_terminal_code {
+                    // Skip until we find 't'
+                    while i < input.len() && input[i] != b't' {
+                        i += 1;
+                    }
+                    i += 1;  // Skip the 't'
+                    continue;
+                }
+            }
+
+            if input[i] == 0x1b {  // ESC
+                // Skip escape sequence
+                i += 1;
+                if i < input.len() && input[i] == b'[' {
+                    i += 1;
+                    while i < input.len() {
+                        let c = input[i];
+                        if (c >= b'A' && c <= b'Z') || (c >= b'a' && c <= b'z') || c == b'@' {
+                            i += 1;
+                            break;
+                        }
+                        i += 1;
+                    }
+                }
+            } else {
+                output.push(input[i]);
+                i += 1;
+            }
+        }
+        
+        // Clean up any remaining terminal codes at the end
+        if let Some(pos) = output.iter().rposition(|&x| x == b';') {
+            if output[pos..].iter().any(|&x| x == b't') {
+                output.truncate(pos);
+            }
+        }
+        
+        output
     }
 }

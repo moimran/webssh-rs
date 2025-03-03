@@ -1,4 +1,9 @@
 mod ssh;
+// The ssh module is now organized into submodules:
+// - ssh/mod.rs: Main module file
+// - ssh/error.rs: Error types
+// - ssh/channel.rs: Channel setup functions
+// - ssh/session.rs: SSHSession implementation
 mod websocket;
 mod settings;
 

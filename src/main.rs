@@ -27,6 +27,7 @@ struct SSHCredentials {
     username: String,
     password: Option<String>,
     private_key: Option<String>,
+    device_type: Option<String>, // Optional field to explicitly specify device type
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -87,6 +88,7 @@ async fn connect_handler(
         &credentials.username,
         credentials.password.as_deref(),
         credentials.private_key.as_deref(),
+        credentials.device_type.as_deref(),
     ) {
         Ok(session) => {
             let session_id = format!("{}-{}", credentials.hostname, uuid::Uuid::new_v4());

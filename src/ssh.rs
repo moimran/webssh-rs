@@ -6,6 +6,47 @@ use thiserror::Error;
 use tracing::{error, info, debug};
 use std::time::Duration;
 
+// Define device types
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum DeviceType {
+    Linux,
+    Cisco,
+    Unknown,
+}
+
+// Function to detect device type based on hostname or other characteristics
+fn detect_device_type(hostname: &str, port: u16) -> DeviceType {
+    // Common Cisco device IP patterns (e.g., 192.168.0.x where x is 1-20)
+    let is_likely_cisco_ip = hostname.starts_with("192.168.") && 
+                             hostname.split('.').nth(3)
+                                .and_then(|s| s.parse::<u16>().ok())
+                                .map_or(false, |n| n <= 20);
+    
+    // Check for Cisco-specific hostnames or IP patterns
+    if hostname.contains("cisco") || 
+       hostname.contains("router") || 
+       hostname.contains("switch") ||
+       is_likely_cisco_ip ||
+       // Common Cisco management ports
+       (port == 22 && (hostname.ends_with(".1") || hostname.ends_with(".254")))
+    {
+        DeviceType::Cisco
+    } 
+    // Check for Linux-specific hostnames
+    else if hostname.contains("linux") || 
+            hostname.contains("ubuntu") || 
+            hostname.contains("debian") || 
+            hostname.contains("centos") || 
+            hostname.contains("fedora") ||
+            hostname.contains("server")
+    {
+        DeviceType::Linux
+    } else {
+        // Default to Unknown, we'll try to detect during connection
+        DeviceType::Unknown
+    }
+}
+
 // Helper function to create a session channel with retries
 fn create_session_channel_with_retries(
     session: &mut Session,
@@ -55,13 +96,14 @@ pub struct SSHSession {
 }
 
 impl SSHSession {
-    pub fn new(
-        hostname: &str,
-        port: u16,
-        username: &str,
-        password: Option<&str>,
-        private_key: Option<&str>,
-    ) -> Result<Self, SSHError> {
+pub fn new(
+    hostname: &str,
+    port: u16,
+    username: &str,
+    password: Option<&str>,
+    private_key: Option<&str>,
+    device_type_hint: Option<&str>,
+) -> Result<Self, SSHError> {
         info!("Connecting to SSH server {}:{}", hostname, port);
         
         // Create TCP connection with timeout
@@ -78,7 +120,7 @@ impl SSHSession {
 
         session.set_tcp_stream(tcp);
         session.set_timeout(60000); // Increase timeout to 60 seconds
-        session.set_compress(true);
+        session.set_compress(false); // Disable compression to avoid protocol issues
         
         // Configure for a wide range of SSH servers (both older and newer)
         session.method_pref(
@@ -105,6 +147,9 @@ impl SSHSession {
             ssh2::MethodType::MacSc,
             "hmac-sha2-256-etm@openssh.com,hmac-sha2-512-etm@openssh.com,hmac-sha1-etm@openssh.com,hmac-sha2-256,hmac-sha2-512,hmac-sha1"
         )?;
+        
+        // Note: ssh2 doesn't have a direct way to set compression method preferences
+        // We've already disabled compression with session.set_compress(false)
 
         debug!("Starting SSH handshake");
         
@@ -165,112 +210,111 @@ impl SSHSession {
         }
         debug!("Authentication successful");
 
+        // Detect device type, using hint if provided
+        let device_type = if let Some(hint) = device_type_hint {
+            match hint.to_lowercase().as_str() {
+                "cisco" | "router" | "switch" => DeviceType::Cisco,
+                "linux" | "ubuntu" | "debian" => DeviceType::Linux,
+                _ => detect_device_type(hostname, port),
+            }
+        } else {
+            detect_device_type(hostname, port)
+        };
+        debug!("Using device type: {:?}", device_type);
+        
         // Create a simple channel
         info!("Creating SSH channel");
         
         // Set a longer timeout for channel operations (2 minutes)
         session.set_timeout(120000);
         
-        // Create a session channel with retries
-        debug!("Creating SSH channel with retries");
-        let mut channel = match create_session_channel_with_retries(&mut session, 5, 9000) {
+        // Create a simple session channel
+        debug!("Creating SSH channel");
+        let mut channel = match session.channel_session() {
             Ok(channel) => {
-                debug!("SSH session channel opened successfully after retries");
+                debug!("SSH session channel opened successfully");
                 channel
             },
             Err(e) => {
-                error!("Failed to open session channel after retries: {}", e);
-                return Err(e);
+                error!("Failed to open session channel: {}", e);
+                return Err(e.into());
             }
         };
         
-        // Add a small delay to allow the server to initialize the channel
-        std::thread::sleep(std::time::Duration::from_millis(1000));
-        
-        // First, try to set up a PTY with retries
-        debug!("Requesting PTY with retries");
-        let mut pty_success = false;
-        
-        for attempt in 1..=3 {
-            debug!("PTY request attempt {}/3", attempt);
-            match channel.request_pty("xterm", None, Some((80, 24, 0, 0))) {
-                Ok(_) => {
-                    debug!("PTY requested successfully on attempt {}", attempt);
-                    pty_success = true;
-                    break;
-                },
-                Err(e) => {
-                    if attempt == 3 {
-                        error!("Failed to request PTY after 3 attempts: {}", e);
-                        debug!("Trying with dumb terminal type...");
-                        
-                        // Try with dumb terminal type as fallback
-                        if let Err(e2) = channel.request_pty("dumb", None, Some((80, 24, 0, 0))) {
-                            error!("Failed to request dumb PTY: {}", e2);
-                            debug!("Continuing without PTY allocation");
-                        } else {
-                            debug!("Dumb PTY requested successfully");
-                            pty_success = true;
-                        }
-                    } else {
-                        debug!("PTY request failed on attempt {}: {}", attempt, e);
-                        std::thread::sleep(std::time::Duration::from_millis(1000));
+        // Set up the session based on device type
+        match device_type {
+            DeviceType::Cisco => {
+                // Cisco devices work better with the original approach
+                debug!("Setting up session for Cisco device");
+                
+                // For Cisco devices, we'll use xterm and just start a shell
+                debug!("Requesting PTY for Cisco device");
+                match channel.request_pty("xterm", None, Some((80, 24, 0, 0))) {
+                    Ok(_) => debug!("PTY requested successfully"),
+                    Err(e) => {
+                        error!("Failed to request PTY: {}", e);
+                        return Err(e.into());
                     }
                 }
-            }
-        }
-        
-        // Add another small delay after PTY setup
-        std::thread::sleep(std::time::Duration::from_millis(1000));
-        
-        // Then, try to start a shell with retries
-        debug!("Starting shell with retries");
-        let mut shell_success = false;
-        
-        for attempt in 1..=3 {
-            debug!("Shell start attempt {}/3", attempt);
-            match channel.shell() {
-                Ok(_) => {
-                    debug!("Shell started successfully on attempt {}", attempt);
-                    shell_success = true;
-                    break;
-                },
-                Err(e) => {
-                    if attempt == 3 {
-                        error!("Failed to start shell after 3 attempts: {}", e);
-                        debug!("Trying to execute /bin/bash as fallback...");
-                        
-                        // Try executing /bin/bash as fallback
-                        if let Err(e2) = channel.exec("/bin/bash") {
-                            error!("Failed to execute /bin/bash: {}", e2);
-                            debug!("Trying to execute /bin/sh as fallback...");
-                            
-                            // Try executing /bin/sh as fallback
-                            if let Err(e3) = channel.exec("/bin/sh") {
-                                error!("Failed to execute /bin/sh: {}", e3);
-                                debug!("Continuing without shell");
-                            } else {
-                                debug!("Executed /bin/sh successfully");
-                                shell_success = true;
+                
+                // Start shell directly for Cisco devices
+                debug!("Starting shell for Cisco device");
+                match channel.shell() {
+                    Ok(_) => debug!("Shell started successfully"),
+                    Err(e) => {
+                        error!("Failed to start shell: {}", e);
+                        return Err(e.into());
+                    }
+                }
+            },
+            DeviceType::Linux | DeviceType::Unknown => {
+                // Linux devices work better with the new approach
+                debug!("Setting up session for Linux/Unknown device");
+                
+                // For Linux devices, we'll use vt100 and try to execute bash
+                debug!("Requesting PTY for Linux/Unknown device");
+                match channel.request_pty("vt100", None, Some((80, 24, 0, 0))) {
+                    Ok(_) => debug!("PTY requested successfully"),
+                    Err(e) => {
+                        error!("Failed to request PTY: {}", e);
+                        // Try with a simpler terminal type as fallback
+                        match channel.request_pty("dumb", None, Some((80, 24, 0, 0))) {
+                            Ok(_) => debug!("Dumb PTY requested successfully"),
+                            Err(e2) => {
+                                error!("Failed to request dumb PTY: {}", e2);
+                                // Don't try more fallbacks - if PTY fails, it's likely a protocol issue
+                                return Err(e.into());
                             }
-                        } else {
-                            debug!("Executed /bin/bash successfully");
-                            shell_success = true;
                         }
-                    } else {
-                        debug!("Shell start failed on attempt {}: {}", attempt, e);
-                        std::thread::sleep(std::time::Duration::from_millis(1000));
+                    }
+                }
+                
+                // Try executing a command instead of starting a shell for Linux devices
+                debug!("Executing command for Linux/Unknown device");
+                match channel.exec("bash") {
+                    Ok(_) => debug!("Command executed successfully"),
+                    Err(e) => {
+                        error!("Failed to execute command: {}", e);
+                        // Try starting a shell as fallback
+                        match channel.shell() {
+                            Ok(_) => debug!("Shell started successfully"),
+                            Err(e2) => {
+                                error!("Failed to start shell: {}", e2);
+                                return Err(e.into());
+                            }
+                        }
                     }
                 }
             }
         }
         
-        // Add a final delay to allow the shell to initialize
-        std::thread::sleep(std::time::Duration::from_millis(2000));
-        
-        // If neither PTY nor shell succeeded, warn but continue
-        if !pty_success && !shell_success {
-            debug!("Warning: Neither PTY nor shell setup was successful. Connection may be limited.");
+        // Ensure channel is ready with a flush
+        debug!("Flushing channel");
+        if let Err(e) = channel.flush() {
+            if e.kind() != std::io::ErrorKind::WouldBlock {
+                error!("Failed to flush channel: {}", e);
+                // Non-blocking errors are expected and can be ignored
+            }
         }
 
         // Set session to non-blocking mode for I/O

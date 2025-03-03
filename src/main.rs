@@ -1,5 +1,6 @@
 mod ssh;
 mod websocket;
+mod settings;
 
 use axum::{
     extract::{
@@ -18,7 +19,7 @@ use tower_http::services::ServeDir;
 use tracing::{error, info, Level};
 use tracing_subscriber::FmtSubscriber;
 
-use crate::{ssh::SSHSession, websocket::WebSocketHandler};
+use crate::{settings::Settings, ssh::SSHSession, websocket::WebSocketHandler};
 
 #[derive(Debug, Serialize, Deserialize)]
 struct SSHCredentials {
@@ -40,6 +41,7 @@ struct ConnectResponse {
 #[derive(Clone)]
 struct AppState {
     sessions: Arc<Mutex<Vec<(String, SSHSession)>>>,
+    settings: Arc<Settings>,
 }
 
 #[tokio::main]
@@ -54,8 +56,13 @@ async fn main() {
         .with_line_number(true)
         .init();
 
+    // Load settings
+    let settings = Arc::new(Settings::load());
+    info!("Settings loaded");
+
     let state = AppState {
         sessions: Arc::new(Mutex::new(Vec::new())),
+        settings: settings.clone(),
     };
 
     // Create router
@@ -67,10 +74,17 @@ async fn main() {
         .with_state(state);
 
     // Start server
-    let addr = "127.0.0.1:8888";
+    let addr = format!("{}:{}", settings.server.address, settings.server.port);
     info!("Starting server on {}", addr);
     
-    let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
+    // For now, we'll just use the non-TLS server
+    // TLS support can be added later with a proper TLS implementation
+    if settings.server.tls_enabled {
+        info!("TLS is enabled in settings, but not implemented in this version");
+        info!("Starting non-TLS server on {}", addr);
+    }
+    
+    let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
     axum::serve(listener, app).await.unwrap();
 }
 
@@ -89,6 +103,7 @@ async fn connect_handler(
         credentials.password.as_deref(),
         credentials.private_key.as_deref(),
         credentials.device_type.as_deref(),
+        &state.settings.ssh,
     ) {
         Ok(session) => {
             let session_id = format!("{}-{}", credentials.hostname, uuid::Uuid::new_v4());

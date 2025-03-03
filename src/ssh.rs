@@ -6,8 +6,11 @@ use thiserror::Error;
 use tracing::{error, info, debug};
 use std::time::Duration;
 
+use crate::settings::SSHSettings;
+
 // Define device types
 #[derive(Debug, Clone, Copy, PartialEq)]
+#[allow(dead_code)]
 pub enum DeviceType {
     Linux,
     Cisco,
@@ -15,7 +18,7 @@ pub enum DeviceType {
 }
 
 // Helper functions for device-specific session setup
-fn setup_standard_session(session: &mut Session) -> Result<ssh2::Channel, SSHError> {
+fn setup_standard_session(session: &mut Session, settings: &SSHSettings) -> Result<ssh2::Channel, SSHError> {
     debug!("Creating SSH channel for standard session");
     let mut channel = match session.channel_session() {
         Ok(channel) => {
@@ -30,7 +33,11 @@ fn setup_standard_session(session: &mut Session) -> Result<ssh2::Channel, SSHErr
     
     // Request PTY with standard terminal type
     debug!("Requesting PTY with standard terminal type");
-    match channel.request_pty("xterm", None, Some((80, 24, 0, 0))) {
+    match channel.request_pty(
+        &settings.terminal.standard_terminal_type, 
+        None, 
+        Some((settings.terminal.default_cols, settings.terminal.default_rows, 0, 0))
+    ) {
         Ok(_) => debug!("PTY requested successfully"),
         Err(e) => {
             error!("Failed to request PTY: {}", e);
@@ -52,7 +59,7 @@ fn setup_standard_session(session: &mut Session) -> Result<ssh2::Channel, SSHErr
     }
 }
 
-fn setup_linux_session(session: &mut Session) -> Result<ssh2::Channel, SSHError> {
+fn setup_linux_session(session: &mut Session, settings: &SSHSettings) -> Result<ssh2::Channel, SSHError> {
     debug!("Creating SSH channel for Linux session");
     let mut channel = match session.channel_session() {
         Ok(channel) => {
@@ -65,14 +72,22 @@ fn setup_linux_session(session: &mut Session) -> Result<ssh2::Channel, SSHError>
         }
     };
     
-    // For Linux devices, we'll use vt100
+    // For Linux devices, we'll use the Linux terminal type from settings
     debug!("Requesting PTY for Linux device");
-    match channel.request_pty("vt100", None, Some((80, 24, 0, 0))) {
+    match channel.request_pty(
+        &settings.terminal.linux_terminal_type, 
+        None, 
+        Some((settings.terminal.default_cols, settings.terminal.default_rows, 0, 0))
+    ) {
         Ok(_) => debug!("PTY requested successfully"),
         Err(e) => {
             error!("Failed to request PTY: {}", e);
             // Try with a simpler terminal type as fallback
-            match channel.request_pty("dumb", None, Some((80, 24, 0, 0))) {
+            match channel.request_pty(
+                &settings.terminal.fallback_terminal_type, 
+                None, 
+                Some((settings.terminal.default_cols, settings.terminal.default_rows, 0, 0))
+            ) {
                 Ok(_) => debug!("Dumb PTY requested successfully"),
                 Err(e2) => {
                     error!("Failed to request dumb PTY: {}", e2);
@@ -97,7 +112,7 @@ fn setup_linux_session(session: &mut Session) -> Result<ssh2::Channel, SSHError>
     }
 }
 
-fn setup_cisco_session(session: &mut Session) -> Result<ssh2::Channel, SSHError> {
+fn setup_cisco_session(session: &mut Session, settings: &SSHSettings) -> Result<ssh2::Channel, SSHError> {
     debug!("Creating SSH channel for Cisco session");
     let mut channel = match session.channel_session() {
         Ok(channel) => {
@@ -110,9 +125,13 @@ fn setup_cisco_session(session: &mut Session) -> Result<ssh2::Channel, SSHError>
         }
     };
     
-    // For Cisco devices, we'll use xterm and just start a shell
+    // For Cisco devices, we'll use the standard terminal type from settings
     debug!("Requesting PTY for Cisco device");
-    match channel.request_pty("xterm", None, Some((80, 24, 0, 0))) {
+    match channel.request_pty(
+        &settings.terminal.standard_terminal_type, 
+        None, 
+        Some((settings.terminal.default_cols, settings.terminal.default_rows, 0, 0))
+    ) {
         Ok(_) => debug!("PTY requested successfully"),
         Err(e) => {
             error!("Failed to request PTY: {}", e);
@@ -135,6 +154,7 @@ fn setup_cisco_session(session: &mut Session) -> Result<ssh2::Channel, SSHError>
 }
 
 // Helper function to create a session channel with retries
+#[allow(dead_code)]
 fn create_session_channel_with_retries(
     session: &mut Session,
     max_attempts: usize,
@@ -180,6 +200,7 @@ pub struct SSHSession {
     session: Session,
     channel: ssh2::Channel,
     resize_rx: Option<mpsc::Receiver<(u32, u32)>>,
+    settings: SSHSettings,
 }
 
 impl SSHSession {
@@ -190,13 +211,14 @@ pub fn new(
     password: Option<&str>,
     private_key: Option<&str>,
     device_type_hint: Option<&str>,
+    settings: &SSHSettings,
 ) -> Result<Self, SSHError> {
         info!("Connecting to SSH server {}:{}", hostname, port);
         
         // Create TCP connection with timeout
         let tcp = TcpStream::connect((hostname, port))?;
-        tcp.set_read_timeout(Some(Duration::from_secs(30)))?;
-        tcp.set_write_timeout(Some(Duration::from_secs(30)))?;
+        tcp.set_read_timeout(Some(Duration::from_secs(settings.connection.read_timeout_seconds)))?;
+        tcp.set_write_timeout(Some(Duration::from_secs(settings.connection.write_timeout_seconds)))?;
         debug!("TCP connection established");
 
         // Create and configure SSH session
@@ -206,37 +228,34 @@ pub fn new(
             ))?;
 
         session.set_tcp_stream(tcp);
-        session.set_timeout(60000); // Increase timeout to 60 seconds
-        session.set_compress(false); // Disable compression to avoid protocol issues
+        session.set_timeout((settings.connection.timeout_seconds * 1000) as u32); // Convert seconds to milliseconds
+        session.set_compress(settings.connection.compress);
         
-        // Configure for a wide range of SSH servers (both older and newer)
+        // Configure SSH algorithms from settings
         session.method_pref(
             ssh2::MethodType::Kex,
-            "curve25519-sha256,curve25519-sha256@libssh.org,ecdh-sha2-nistp256,ecdh-sha2-nistp384,ecdh-sha2-nistp521,diffie-hellman-group-exchange-sha256,diffie-hellman-group16-sha512,diffie-hellman-group18-sha512,diffie-hellman-group14-sha256,diffie-hellman-group14-sha1,diffie-hellman-group1-sha1"
+            &settings.crypto.kex_algorithms
         )?;
         session.method_pref(
             ssh2::MethodType::HostKey,
-            "ssh-ed25519,ecdsa-sha2-nistp256,ecdsa-sha2-nistp384,ecdsa-sha2-nistp521,rsa-sha2-512,rsa-sha2-256,ssh-rsa,ssh-dss"
+            &settings.crypto.host_key_algorithms
         )?;
         session.method_pref(
             ssh2::MethodType::CryptCs,
-            "chacha20-poly1305@openssh.com,aes256-gcm@openssh.com,aes128-gcm@openssh.com,aes256-ctr,aes192-ctr,aes128-ctr,aes256-cbc,aes192-cbc,aes128-cbc,3des-cbc"
+            &settings.crypto.encryption_client_to_server
         )?;
         session.method_pref(
             ssh2::MethodType::CryptSc,
-            "chacha20-poly1305@openssh.com,aes256-gcm@openssh.com,aes128-gcm@openssh.com,aes256-ctr,aes192-ctr,aes128-ctr,aes256-cbc,aes192-cbc,aes128-cbc,3des-cbc"
+            &settings.crypto.encryption_server_to_client
         )?;
         session.method_pref(
             ssh2::MethodType::MacCs,
-            "hmac-sha2-256-etm@openssh.com,hmac-sha2-512-etm@openssh.com,hmac-sha1-etm@openssh.com,hmac-sha2-256,hmac-sha2-512,hmac-sha1"
+            &settings.crypto.mac_client_to_server
         )?;
         session.method_pref(
             ssh2::MethodType::MacSc,
-            "hmac-sha2-256-etm@openssh.com,hmac-sha2-512-etm@openssh.com,hmac-sha1-etm@openssh.com,hmac-sha2-256,hmac-sha2-512,hmac-sha1"
+            &settings.crypto.mac_server_to_client
         )?;
-        
-        // Note: ssh2 doesn't have a direct way to set compression method preferences
-        // We've already disabled compression with session.set_compress(false)
 
         debug!("Starting SSH handshake");
         
@@ -259,7 +278,7 @@ pub fn new(
 
         // Configure session
         session.set_blocking(true);
-        session.set_keepalive(true, 30);
+        session.set_keepalive(true, settings.connection.keepalive_seconds as u32);
 
         // Authenticate
         if let Some(password) = password {
@@ -300,8 +319,8 @@ pub fn new(
         // Create a simple channel
         info!("Creating SSH channel");
         
-        // Set a longer timeout for channel operations (2 minutes)
-        session.set_timeout(120000);
+        // Set a longer timeout for channel operations
+        session.set_timeout((settings.connection.channel_timeout_seconds * 1000) as u32);
         
         // Get device type hint if provided
         let device_type_hint = device_type_hint.map(|hint| hint.to_lowercase());
@@ -311,11 +330,11 @@ pub fn new(
         // Set up the channel based on device type with fallback mechanism
         let mut channel = if is_cisco_hint {
             debug!("Using Cisco approach based on user hint");
-            setup_cisco_session(&mut session)?
+            setup_cisco_session(&mut session, settings)?
         } else {
             // Try standard approach first (similar to electerm)
             debug!("Trying standard approach first");
-            match setup_standard_session(&mut session) {
+            match setup_standard_session(&mut session, settings) {
                 Ok(channel) => {
                     debug!("Standard approach succeeded");
                     channel
@@ -323,7 +342,7 @@ pub fn new(
                 Err(e) => {
                     debug!("Standard approach failed: {}. Trying Linux approach", e);
                     // If standard approach fails, try Linux approach
-                    match setup_linux_session(&mut session) {
+                    match setup_linux_session(&mut session, settings) {
                         Ok(channel) => {
                             debug!("Linux approach succeeded");
                             channel
@@ -331,7 +350,7 @@ pub fn new(
                         Err(e) => {
                             debug!("Linux approach failed: {}. Trying Cisco approach as final fallback", e);
                             // If Linux approach fails, try Cisco approach as final fallback
-                            setup_cisco_session(&mut session)?
+                            setup_cisco_session(&mut session, settings)?
                         }
                     }
                 }
@@ -355,6 +374,7 @@ pub fn new(
             session,
             channel,
             resize_rx: None,
+            settings: settings.clone(),
         })
     }
 
@@ -440,8 +460,8 @@ pub fn new(
         let mut resize_rx = self.resize_rx.take();
         
         loop {
-            // Send keepalive every 30 seconds
-            if last_keepalive.elapsed() >= std::time::Duration::from_secs(30) {
+            // Send keepalive based on settings
+            if last_keepalive.elapsed() >= std::time::Duration::from_secs(self.settings.connection.keepalive_seconds) {
                 debug!("Sending keepalive");
                 if let Err(e) = self.session.keepalive_send() {
                     error!("Failed to send keepalive: {}", e);

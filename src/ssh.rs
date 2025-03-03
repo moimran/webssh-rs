@@ -48,19 +48,50 @@ impl SSHSession {
         session.set_timeout(60000); // Increase timeout to 60 seconds
         session.set_compress(true);
         
-        // Configure for older SSH servers
+        // Configure for a wide range of SSH servers (both older and newer)
         session.method_pref(
             ssh2::MethodType::Kex,
-            "diffie-hellman-group1-sha1,diffie-hellman-group14-sha1"
+            "curve25519-sha256,curve25519-sha256@libssh.org,ecdh-sha2-nistp256,ecdh-sha2-nistp384,ecdh-sha2-nistp521,diffie-hellman-group-exchange-sha256,diffie-hellman-group16-sha512,diffie-hellman-group18-sha512,diffie-hellman-group14-sha256,diffie-hellman-group14-sha1,diffie-hellman-group1-sha1"
         )?;
         session.method_pref(
             ssh2::MethodType::HostKey,
-            "ssh-rsa,ssh-dss"
+            "ssh-ed25519,ecdsa-sha2-nistp256,ecdsa-sha2-nistp384,ecdsa-sha2-nistp521,rsa-sha2-512,rsa-sha2-256,ssh-rsa,ssh-dss"
+        )?;
+        session.method_pref(
+            ssh2::MethodType::CryptCs,
+            "chacha20-poly1305@openssh.com,aes256-gcm@openssh.com,aes128-gcm@openssh.com,aes256-ctr,aes192-ctr,aes128-ctr,aes256-cbc,aes192-cbc,aes128-cbc,3des-cbc"
+        )?;
+        session.method_pref(
+            ssh2::MethodType::CryptSc,
+            "chacha20-poly1305@openssh.com,aes256-gcm@openssh.com,aes128-gcm@openssh.com,aes256-ctr,aes192-ctr,aes128-ctr,aes256-cbc,aes192-cbc,aes128-cbc,3des-cbc"
+        )?;
+        session.method_pref(
+            ssh2::MethodType::MacCs,
+            "hmac-sha2-256-etm@openssh.com,hmac-sha2-512-etm@openssh.com,hmac-sha1-etm@openssh.com,hmac-sha2-256,hmac-sha2-512,hmac-sha1"
+        )?;
+        session.method_pref(
+            ssh2::MethodType::MacSc,
+            "hmac-sha2-256-etm@openssh.com,hmac-sha2-512-etm@openssh.com,hmac-sha1-etm@openssh.com,hmac-sha2-256,hmac-sha2-512,hmac-sha1"
         )?;
 
         debug!("Starting SSH handshake");
-        session.handshake()?;
-        debug!("SSH handshake completed");
+        
+        // Log available methods before handshake
+        // Note: These might not be available until after the handshake
+        debug!("Configured KEX methods: curve25519-sha256,curve25519-sha256@libssh.org,ecdh-sha2-nistp256,ecdh-sha2-nistp384,ecdh-sha2-nistp521,diffie-hellman-group-exchange-sha256,diffie-hellman-group16-sha512,diffie-hellman-group18-sha512,diffie-hellman-group14-sha256,diffie-hellman-group14-sha1,diffie-hellman-group1-sha1");
+        debug!("Configured host key methods: ssh-ed25519,ecdsa-sha2-nistp256,ecdsa-sha2-nistp384,ecdsa-sha2-nistp521,rsa-sha2-512,rsa-sha2-256,ssh-rsa,ssh-dss");
+        debug!("Configured client->server encryption methods: chacha20-poly1305@openssh.com,aes256-gcm@openssh.com,aes128-gcm@openssh.com,aes256-ctr,aes192-ctr,aes128-ctr,aes256-cbc,aes192-cbc,aes128-cbc,3des-cbc");
+        debug!("Configured server->client encryption methods: chacha20-poly1305@openssh.com,aes256-gcm@openssh.com,aes128-gcm@openssh.com,aes256-ctr,aes192-ctr,aes128-ctr,aes256-cbc,aes192-cbc,aes128-cbc,3des-cbc");
+        
+        // Perform handshake with detailed error handling
+        match session.handshake() {
+            Ok(_) => debug!("SSH handshake completed successfully"),
+            Err(e) => {
+                error!("SSH handshake failed: {}", e);
+                error!("This could be due to incompatible encryption algorithms or network issues");
+                return Err(e.into());
+            }
+        }
 
         // Configure session
         session.set_blocking(true);
@@ -70,9 +101,29 @@ impl SSHSession {
         if let Some(password) = password {
             info!("Authenticating with password for user {}", username);
             session.userauth_password(username, password)?;
-        } else if let Some(_key) = private_key {
-            // TODO: Implement private key authentication
-            return Err(SSHError::Authentication("Private key auth not implemented".into()));
+        } else if let Some(key_data) = private_key {
+            info!("Authenticating with private key for user {}", username);
+            
+            // Try to parse the private key
+            debug!("Parsing private key");
+            
+            // First, check if the key is in PEM format
+            if key_data.contains("-----BEGIN") {
+                debug!("Key appears to be in PEM format");
+                
+                // Try to load the private key
+                match session.userauth_pubkey_memory(username, None, key_data, None) {
+                    Ok(_) => debug!("Private key authentication successful"),
+                    Err(e) => {
+                        error!("Private key authentication failed: {}", e);
+                        return Err(SSHError::Authentication(format!("Private key authentication failed: {}", e)));
+                    }
+                }
+            } else {
+                // If not in PEM format, it might be in OpenSSH format or another format
+                error!("Unsupported private key format. Please provide a PEM formatted private key");
+                return Err(SSHError::Authentication("Unsupported private key format. Please provide a PEM formatted private key".into()));
+            }
         } else {
             return Err(SSHError::Authentication("No authentication method provided".into()));
         }
@@ -82,22 +133,57 @@ impl SSHSession {
         }
         debug!("Authentication successful");
 
-        // Create channel
+        // Create a simple channel
         info!("Creating SSH channel");
+        
+        // Create a session channel
         let mut channel = session.channel_session()?;
+        debug!("SSH session channel opened successfully");
         
-        // Set up the PTY
+        // Set timeout for channel operations
+        session.set_timeout(60000);
+        
+        // First, try to set up a PTY
         debug!("Requesting PTY");
-        // Use xterm instead of dumb for better terminal support
-        channel.request_pty("xterm", None, Some((80, 24, 0, 0)))?;
+        if let Err(e) = channel.request_pty("xterm", None, Some((80, 24, 0, 0))) {
+            error!("Failed to request PTY: {}", e);
+            debug!("Trying with dumb terminal type...");
+            
+            // Try with dumb terminal type as fallback
+            if let Err(e2) = channel.request_pty("dumb", None, Some((80, 24, 0, 0))) {
+                error!("Failed to request dumb PTY: {}", e2);
+                debug!("Continuing without PTY allocation");
+            } else {
+                debug!("Dumb PTY requested successfully");
+            }
+        } else {
+            debug!("PTY requested successfully");
+        }
         
-        // Start shell
+        // Then, try to start a shell
         debug!("Starting shell");
-        channel.shell()?;
-        
-        // Ensure channel is ready
-        debug!("Flushing channel");
-        channel.flush()?;
+        if let Err(e) = channel.shell() {
+            error!("Failed to start shell: {}", e);
+            debug!("Trying to execute /bin/bash as fallback...");
+            
+            // Try executing /bin/bash as fallback
+            if let Err(e2) = channel.exec("/bin/bash") {
+                error!("Failed to execute /bin/bash: {}", e2);
+                debug!("Trying to execute /bin/sh as fallback...");
+                
+                // Try executing /bin/sh as fallback
+                if let Err(e3) = channel.exec("/bin/sh") {
+                    error!("Failed to execute /bin/sh: {}", e3);
+                    debug!("Continuing without shell");
+                } else {
+                    debug!("Executed /bin/sh successfully");
+                }
+            } else {
+                debug!("Executed /bin/bash successfully");
+            }
+        } else {
+            debug!("Shell started successfully");
+        }
 
         // Set session to non-blocking mode for I/O
         session.set_blocking(false);

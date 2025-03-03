@@ -33,12 +33,18 @@
             margin-bottom: 5px;
             font-weight: bold;
         }
-        input {
+        input, textarea, select {
             width: 100%;
             padding: 8px;
             border: 1px solid #ddd;
             border-radius: 4px;
             box-sizing: border-box;
+            font-family: monospace;
+        }
+        
+        textarea {
+            resize: vertical;
+            min-height: 100px;
         }
         button {
             background-color: #4CAF50;
@@ -73,8 +79,19 @@
             <input type="text" id="username" required>
         </div>
         <div class="form-group">
+            <label for="auth-type">Authentication Method:</label>
+            <select id="auth-type" onchange="toggleAuthMethod()">
+                <option value="password">Password</option>
+                <option value="private-key">Private Key</option>
+            </select>
+        </div>
+        <div id="password-auth" class="form-group">
             <label for="password">Password:</label>
             <input type="password" id="password">
+        </div>
+        <div id="private-key-auth" class="form-group" style="display: none;">
+            <label for="private-key">Private Key (PEM format):</label>
+            <textarea id="private-key" rows="5" placeholder="Paste your private key here (including BEGIN and END lines)"></textarea>
         </div>
         <button onclick="connect()">Connect</button>
         <div id="error-message"></div>
@@ -164,6 +181,21 @@
             }
         };
 
+        // Toggle between password and private key authentication
+        function toggleAuthMethod() {
+            const authType = document.getElementById('auth-type').value;
+            const passwordAuth = document.getElementById('password-auth');
+            const privateKeyAuth = document.getElementById('private-key-auth');
+            
+            if (authType === 'password') {
+                passwordAuth.style.display = 'block';
+                privateKeyAuth.style.display = 'none';
+            } else {
+                passwordAuth.style.display = 'none';
+                privateKeyAuth.style.display = 'block';
+            }
+        }
+
         async function connect() {
             if (!term) {
                 showError('Terminal not initialized');
@@ -173,7 +205,20 @@
             const hostname = document.getElementById('hostname').value;
             const port = parseInt(document.getElementById('port').value);
             const username = document.getElementById('username').value;
-            const password = document.getElementById('password').value;
+            const authType = document.getElementById('auth-type').value;
+            
+            // Prepare credentials based on authentication method
+            const credentials = {
+                hostname,
+                port,
+                username
+            };
+            
+            if (authType === 'password') {
+                credentials.password = document.getElementById('password').value;
+            } else {
+                credentials.private_key = document.getElementById('private-key').value;
+            }
 
             try {
                 if (ws) {
@@ -188,12 +233,7 @@
                     headers: {
                         'Content-Type': 'application/json',
                     },
-                    body: JSON.stringify({
-                        hostname,
-                        port,
-                        username,
-                        password,
-                    }),
+                    body: JSON.stringify(credentials),
                 });
 
                 const result = await response.json();
@@ -237,10 +277,28 @@
                     ws.send(JSON.stringify(dimensions));
 
                     // Handle terminal input
-                    // Disable local echo by handling input manually
-                    // We send the data to the server but don't echo it locally
+                    // We need to debounce the input to prevent multiple messages for the same input
+                    let inputQueue = [];
+                    let processingInput = false;
+                    
                     term.onData(data => {
                         if (ws && ws.readyState === WebSocket.OPEN) {
+                            // Add the data to the queue
+                            inputQueue.push(data);
+                            
+                            // Process the queue if not already processing
+                            if (!processingInput) {
+                                processingInput = true;
+                                processInputQueue();
+                            }
+                        }
+                    });
+                    
+                    // Process the input queue with a small delay to prevent multiple messages
+                    function processInputQueue() {
+                        if (inputQueue.length > 0) {
+                            const data = inputQueue.shift();
+                            
                             // Send the data to the server without echoing locally
                             ws.send(JSON.stringify({
                                 type: 'input',
@@ -249,8 +307,13 @@
                             
                             // We don't call term.write(data) here, which prevents local echo
                             // The server will echo back the characters if needed
+                            
+                            // Process the next item in the queue after a small delay
+                            setTimeout(processInputQueue, 10);
+                        } else {
+                            processingInput = false;
                         }
-                    });
+                    }
                 };
 
                 ws.onmessage = (event) => {

@@ -80,7 +80,7 @@ async fn index_handler() -> impl IntoResponse {
 async fn connect_handler(
     State(state): State<AppState>,
     Json(credentials): Json<SSHCredentials>,
-) -> impl IntoResponse {
+) -> Json<ConnectResponse> {
     match SSHSession::new(
         &credentials.hostname,
         credentials.port,

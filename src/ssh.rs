@@ -6,6 +6,38 @@ use thiserror::Error;
 use tracing::{error, info, debug};
 use std::time::Duration;
 
+// Helper function to create a session channel with retries
+fn create_session_channel_with_retries(
+    session: &mut Session,
+    max_attempts: usize,
+    retry_delay_ms: u64,
+) -> Result<ssh2::Channel, SSHError> {
+    for attempt in 1..=max_attempts {
+        debug!("Session channel creation attempt {}/{}", attempt, max_attempts);
+        match session.channel_session() {
+            Ok(channel) => {
+                debug!("Session channel created successfully on attempt {}", attempt);
+                return Ok(channel);
+            },
+            Err(e) => {
+                if attempt == max_attempts {
+                    error!("Failed to create session channel after {} attempts: {}", max_attempts, e);
+                    return Err(e.into());
+                } else {
+                    debug!("Session channel creation failed on attempt {}: {}", attempt, e);
+                    std::thread::sleep(std::time::Duration::from_millis(retry_delay_ms));
+                }
+            }
+        }
+    }
+    
+    // This should never be reached due to the return in the loop above
+    Err(SSHError::Connection(std::io::Error::new(
+        std::io::ErrorKind::Other,
+        "Failed to create session channel after retries"
+    )))
+}
+
 #[derive(Error, Debug)]
 pub enum SSHError {
     #[error("SSH connection error: {0}")]
@@ -136,53 +168,109 @@ impl SSHSession {
         // Create a simple channel
         info!("Creating SSH channel");
         
-        // Create a session channel
-        let mut channel = session.channel_session()?;
-        debug!("SSH session channel opened successfully");
+        // Set a longer timeout for channel operations (2 minutes)
+        session.set_timeout(120000);
         
-        // Set timeout for channel operations
-        session.set_timeout(60000);
-        
-        // First, try to set up a PTY
-        debug!("Requesting PTY");
-        if let Err(e) = channel.request_pty("xterm", None, Some((80, 24, 0, 0))) {
-            error!("Failed to request PTY: {}", e);
-            debug!("Trying with dumb terminal type...");
-            
-            // Try with dumb terminal type as fallback
-            if let Err(e2) = channel.request_pty("dumb", None, Some((80, 24, 0, 0))) {
-                error!("Failed to request dumb PTY: {}", e2);
-                debug!("Continuing without PTY allocation");
-            } else {
-                debug!("Dumb PTY requested successfully");
+        // Create a session channel with retries
+        debug!("Creating SSH channel with retries");
+        let mut channel = match create_session_channel_with_retries(&mut session, 5, 9000) {
+            Ok(channel) => {
+                debug!("SSH session channel opened successfully after retries");
+                channel
+            },
+            Err(e) => {
+                error!("Failed to open session channel after retries: {}", e);
+                return Err(e);
             }
-        } else {
-            debug!("PTY requested successfully");
+        };
+        
+        // Add a small delay to allow the server to initialize the channel
+        std::thread::sleep(std::time::Duration::from_millis(1000));
+        
+        // First, try to set up a PTY with retries
+        debug!("Requesting PTY with retries");
+        let mut pty_success = false;
+        
+        for attempt in 1..=3 {
+            debug!("PTY request attempt {}/3", attempt);
+            match channel.request_pty("xterm", None, Some((80, 24, 0, 0))) {
+                Ok(_) => {
+                    debug!("PTY requested successfully on attempt {}", attempt);
+                    pty_success = true;
+                    break;
+                },
+                Err(e) => {
+                    if attempt == 3 {
+                        error!("Failed to request PTY after 3 attempts: {}", e);
+                        debug!("Trying with dumb terminal type...");
+                        
+                        // Try with dumb terminal type as fallback
+                        if let Err(e2) = channel.request_pty("dumb", None, Some((80, 24, 0, 0))) {
+                            error!("Failed to request dumb PTY: {}", e2);
+                            debug!("Continuing without PTY allocation");
+                        } else {
+                            debug!("Dumb PTY requested successfully");
+                            pty_success = true;
+                        }
+                    } else {
+                        debug!("PTY request failed on attempt {}: {}", attempt, e);
+                        std::thread::sleep(std::time::Duration::from_millis(1000));
+                    }
+                }
+            }
         }
         
-        // Then, try to start a shell
-        debug!("Starting shell");
-        if let Err(e) = channel.shell() {
-            error!("Failed to start shell: {}", e);
-            debug!("Trying to execute /bin/bash as fallback...");
-            
-            // Try executing /bin/bash as fallback
-            if let Err(e2) = channel.exec("/bin/bash") {
-                error!("Failed to execute /bin/bash: {}", e2);
-                debug!("Trying to execute /bin/sh as fallback...");
-                
-                // Try executing /bin/sh as fallback
-                if let Err(e3) = channel.exec("/bin/sh") {
-                    error!("Failed to execute /bin/sh: {}", e3);
-                    debug!("Continuing without shell");
-                } else {
-                    debug!("Executed /bin/sh successfully");
+        // Add another small delay after PTY setup
+        std::thread::sleep(std::time::Duration::from_millis(1000));
+        
+        // Then, try to start a shell with retries
+        debug!("Starting shell with retries");
+        let mut shell_success = false;
+        
+        for attempt in 1..=3 {
+            debug!("Shell start attempt {}/3", attempt);
+            match channel.shell() {
+                Ok(_) => {
+                    debug!("Shell started successfully on attempt {}", attempt);
+                    shell_success = true;
+                    break;
+                },
+                Err(e) => {
+                    if attempt == 3 {
+                        error!("Failed to start shell after 3 attempts: {}", e);
+                        debug!("Trying to execute /bin/bash as fallback...");
+                        
+                        // Try executing /bin/bash as fallback
+                        if let Err(e2) = channel.exec("/bin/bash") {
+                            error!("Failed to execute /bin/bash: {}", e2);
+                            debug!("Trying to execute /bin/sh as fallback...");
+                            
+                            // Try executing /bin/sh as fallback
+                            if let Err(e3) = channel.exec("/bin/sh") {
+                                error!("Failed to execute /bin/sh: {}", e3);
+                                debug!("Continuing without shell");
+                            } else {
+                                debug!("Executed /bin/sh successfully");
+                                shell_success = true;
+                            }
+                        } else {
+                            debug!("Executed /bin/bash successfully");
+                            shell_success = true;
+                        }
+                    } else {
+                        debug!("Shell start failed on attempt {}: {}", attempt, e);
+                        std::thread::sleep(std::time::Duration::from_millis(1000));
+                    }
                 }
-            } else {
-                debug!("Executed /bin/bash successfully");
             }
-        } else {
-            debug!("Shell started successfully");
+        }
+        
+        // Add a final delay to allow the shell to initialize
+        std::thread::sleep(std::time::Duration::from_millis(2000));
+        
+        // If neither PTY nor shell succeeded, warn but continue
+        if !pty_success && !shell_success {
+            debug!("Warning: Neither PTY nor shell setup was successful. Connection may be limited.");
         }
 
         // Set session to non-blocking mode for I/O
